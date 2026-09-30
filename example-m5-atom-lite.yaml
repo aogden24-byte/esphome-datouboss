@@ -1,0 +1,44 @@
+# Example device config for an M5Stack Atom Lite on the Atomic RS485 base.
+# Copy this into your ESPHome dashboard and fill in secrets.yaml.
+# Everything inverter-specific comes from the package; this file only
+# holds board, network and security settings.
+
+substitutions:
+  device_name: datouboss-inverter
+  friendly_name: DatouBoss Inverter
+  # Atomic RS485 base pins on the Atom Lite. Change these for other boards.
+  uart_rx_pin: GPIO22
+  uart_tx_pin: GPIO19
+  # Modbus slave address of the inverter (factory default is 1).
+  modbus_address: "1"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret datouboss_api_key
+
+ota:
+  - platform: esphome
+    password: !secret datouboss_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+packages:
+  datouboss:
+    url: https://github.com/aogden24-byte/esphome-datouboss
+    ref: main
+    files: [datouboss.yaml]
+    refresh: 1d
