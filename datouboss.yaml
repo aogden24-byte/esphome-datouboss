@@ -1,0 +1,1417 @@
+# ============================================================
+# Datouboss 4863U (SRNE-based) RS485 / Modbus package for ESPHome
+#
+# Include this from your device config with `packages:`.
+# See README.md for wiring, the confirmed register map, and caveats.
+#
+# Tested on: Datouboss 4863U, 6300 W, 48 V, 120 V/60 Hz single phase,
+# via the WiFi-dongle RJ45 port (NOT the BMS port).
+#
+# SAFETY: every template switch below uses restore_mode: DISABLED so
+# nothing is written to the inverter on boot. Keep it that way.
+# ============================================================
+
+# Defaults - override any of these in your own device config.
+substitutions:
+  uart_rx_pin: GPIO22
+  uart_tx_pin: GPIO19
+  modbus_address: "1"
+
+uart:
+  id: mod_uart
+  rx_pin: ${uart_rx_pin}
+  tx_pin: ${uart_tx_pin}
+  baud_rate: 9600
+  stop_bits: 1
+  data_bits: 8
+  parity: NONE
+  rx_full_threshold: 1
+  rx_timeout: 2
+
+modbus:
+  id: modbus0
+  uart_id: mod_uart
+  turnaround_time: 20ms
+
+modbus_controller:
+  - id: datouboss_fast
+    address: ${modbus_address}
+    modbus_id: modbus0
+    setup_priority: -10
+    update_interval: 1s
+
+  - id: datouboss_slow
+    address: ${modbus_address}
+    modbus_id: modbus0
+    setup_priority: -10
+    update_interval: 20s
+
+# ====================================================
+# INVERTER POWER SWITCH — confirmed 2026-09-30 via RS485 sniff.
+# Register 0x0087, low byte only: write 0x0100 for OFF, 0x0101 for ON.
+# High byte observed constant at 0x01 across every read regardless of
+# state, so it's hardcoded here rather than preserved via read-back.
+# (The old 0xDF00 attempt is gone — that address was rejected outright
+# with Modbus exception 2 and never worked.)
+#
+# NOTE: this file has exactly ONE "number:" key, covering every
+# writable register below (power switch through max charge current).
+# Do not add a second "number:" block — YAML/ESPHome will reject a
+# duplicate top-level key. Same rule for "switch:" and "select:".
+# ====================================================
+number:
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: inverter_output_enable_num
+    address: 0x0087
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: "return (uint16_t)(0x0100 | ((uint16_t)x & 0xFF));"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: intelligent_output_switch_num
+    address: 0x007B
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 1
+    step: 1
+
+  # Confirmed 2026-09-30. Register 0x0072 LOW byte, shares the register
+  # with Over Temp Restart below — the high byte is preserved on write,
+  # not clobbered.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: grid_connected_mode_num
+    address: 0x0072
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 3
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: |-
+      float restart_f = id(setting_over_temp_restart_num).state;
+      if (isnan(restart_f)) return NAN;
+      uint16_t restart = (uint16_t) restart_f;
+      return (uint16_t)((restart << 8) | ((uint16_t)x & 0xFF));
+
+  # Confirmed 2026-09-30. Register 0x0072 HIGH byte — see above.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_over_temp_restart_num
+    address: 0x0072
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float grid_mode_f = id(grid_connected_mode_num).state;
+      if (isnan(grid_mode_f)) return NAN;
+      uint16_t grid_mode = (uint16_t) grid_mode_f;
+      return (uint16_t)(((uint16_t)x << 8) | (grid_mode & 0xFF));
+
+  # Confirmed 2026-09-30, corrected address from the original guess of
+  # 0x0090 (wrong) to 0x0063 (right). Numeric order confirmed both
+  # directions (0=SNU, 1=OSO). 2=CSO inferred, not directly tested.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_charger_priority_num
+    address: 0x0063
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 2
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: "return (uint16_t)(((uint16_t)x << 8) | 0x00);"
+
+  # Untouched this session; label meaning ("PACE") confirmed correct by
+  # you against the real manual, but the underlying numeric value was
+  # never independently re-verified with a fresh write test.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_bms_protocol_num
+    address: 0x0088
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 10
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float batt_type_f = id(setting_battery_type_num).state;
+      if (isnan(batt_type_f)) return NAN;
+      uint16_t batt_type = (uint16_t) batt_type_f;
+      return (uint16_t)(((uint16_t)x << 8) | (batt_type & 0xFF));
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_battery_type_num
+    address: 0x0088
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 10
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: |-
+      float proto_f = id(setting_bms_protocol_num).state;
+      if (isnan(proto_f)) return NAN;
+      uint16_t proto = (uint16_t) proto_f;
+      return (uint16_t)(((uint16_t)proto << 8) | ((uint16_t)x & 0xFF));
+
+  # Confirmed correct as-is by direct write test (12A -> 13A).
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_ac_input_limit
+    name: "Setting A16: Master AC Input Limit"
+    address: 0x0075
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    min_value: 0
+    max_value: 60
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: "return (uint16_t)(((uint16_t)x << 8) | 0x00);"
+
+  # Confirmed 2026-09-30 by direct write test — corrected from the old
+  # "AC Charge Start/Stop SOC" guess, which was the wrong meaning at the
+  # right address.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_mains_supply_soc
+    name: "Setting: Priority Inverter To Mains Supply SOC"
+    address: 0x008A
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float batt_soc_f = id(setting_battery_powered_soc).state;
+      if (isnan(batt_soc_f)) return NAN;
+      uint16_t batt_soc = (uint16_t) batt_soc_f;
+      return (uint16_t)(((uint16_t)x << 8) | (batt_soc & 0xFF));
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_battery_powered_soc
+    name: "Setting: Priority Inverter To Battery Powered SOC"
+    address: 0x008A
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: |-
+      float mains_soc_f = id(setting_mains_supply_soc).state;
+      if (isnan(mains_soc_f)) return NAN;
+      uint16_t mains_soc = (uint16_t) mains_soc_f;
+      return (uint16_t)(((uint16_t)mains_soc << 8) | ((uint16_t)x & 0xFF));
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_float_charge_voltage
+    name: "Setting: Float Charge Voltage"
+    address: 0x0068
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    min_value: 40.0
+    max_value: 60.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0);"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_bulk_voltage
+    name: "Setting: Max Charge and Bulk Voltage (role unclear)"
+    address: 0x006B
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    min_value: 40.0
+    max_value: 60.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0);"
+
+  # Register confirmed correct (write lands, echoes correctly). BUT:
+  # tested twice this session with the battery sitting several minutes,
+  # comfortably above this threshold, in two different Grid Connected
+  # Modes — charging never responded. Address is right; whether this
+  # setting actually does anything on this firmware is now in serious
+  # doubt.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_charge_disconnect_v
+    name: "Setting: Charge Disconnect Voltage"
+    address: 0x0067
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 45.0
+    max_value: 56.8
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  # Corrected 2026-09-30: this is "Inverter Priority Battery Supply
+  # Voltage" (governs load-source switchover in SBU mode), not "Grid
+  # Charge Disable Voltage" as originally guessed. Confirmed both
+  # directions by direct write test.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_battery_supply_v
+    name: "Setting: Inverter Priority Battery Supply Voltage"
+    address: 0x0070
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    min_value: 40.0
+    max_value: 60.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0);"
+
+  # Corrected 2026-09-30: this is "Inverter Priority Mains Supply
+  # Voltage", not "Low Voltage Disconnect". Confirmed by direct write
+  # test.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_mains_supply_v
+    name: "Setting: Inverter Priority Mains Supply Voltage"
+    address: 0x0071
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    min_value: 40.0
+    max_value: 55.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0);"
+
+  # Untouched this session — still an inherited guess, never tested.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_grid_charge_enable_v
+    name: "Setting: Grid Charge Enable Voltage (unconfirmed)"
+    address: 0x006E
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    min_value: 40.0
+    max_value: 55.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0);"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_max_charge_current
+    name: "Setting: Max Total Charge Current"
+    address: 0x0064
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    min_value: 0
+    max_value: 100
+    step: 5
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: "return (uint16_t)(((uint16_t)x << 8) | 0x0A);"
+
+  # Confirmed 2026-09-30: only two of these four values were directly
+  # observed by real app before/after writes — 2=PV, 3=Battery. "Grid"
+  # was never tested; not writable until confirmed (see select below).
+  # Read-only: 0x0060's low byte was never write-tested, so no
+  # write_lambda is defined here — writing to this number would send a
+  # low byte of 0x00 and could clobber whatever that half actually
+  # controls. Change this setting from the app until that's confirmed.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_load_priority_num
+    address: 0x0060
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 2
+    max_value: 3
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+
+switch:
+  - platform: template
+    name: "Inverter Power Switch"
+    id: inverter_power_switch
+    icon: "mdi:power"
+    # Reads real state from 0x0087 (low byte 1 = on) instead of guessing.
+    optimistic: false
+    lambda: |-
+      if (!id(inverter_output_enable_num).has_state()) return {};
+      return id(inverter_output_enable_num).state > 0.5;
+    # CRITICAL: DISABLED means no turn_on/turn_off action fires at boot.
+    # Without it, ESPHome defaults to ALWAYS_OFF and would switch the
+    # inverter output OFF on every reboot/reflash.
+    restore_mode: DISABLED
+    turn_on_action:
+      - number.set:
+          id: inverter_output_enable_num
+          value: 1
+    turn_off_action:
+      - number.set:
+          id: inverter_output_enable_num
+          value: 0
+
+  # Confirmed 2026-09-30, both directions. Register 0x007B, whole
+  # register, 1=On / 0=Off. Possibly the ECO/idle-reduction behavior —
+  # never got a clean before/after wattage comparison, worth revisiting.
+  - platform: template
+    name: "Intelligent Output Switch"
+    id: intelligent_output_switch
+    icon: "mdi:leaf"
+    optimistic: false
+    restore_mode: DISABLED
+    lambda: |-
+      if (!id(intelligent_output_switch_num).has_state()) return {};
+      return id(intelligent_output_switch_num).state > 0.5;
+    turn_on_action:
+      - number.set:
+          id: intelligent_output_switch_num
+          value: 1
+    turn_off_action:
+      - number.set:
+          id: intelligent_output_switch_num
+          value: 0
+
+  # Confirmed 2026-09-30. Register 0x0072 HIGH byte, shares the register
+  # with Grid Connected Mode below — the low byte is preserved on write,
+  # not clobbered.
+  - platform: template
+    name: "Setting: Over Temperature Restart"
+    id: setting_over_temp_restart
+    optimistic: false
+    restore_mode: DISABLED
+    lambda: |-
+      if (!id(setting_over_temp_restart_num).has_state()) return {};
+      return id(setting_over_temp_restart_num).state > 0.5;
+    turn_on_action:
+      - number.set:
+          id: setting_over_temp_restart_num
+          value: 1
+    turn_off_action:
+      - number.set:
+          id: setting_over_temp_restart_num
+          value: 0
+
+# ====================================================
+# SETTINGS MENUS
+# ====================================================
+select:
+  # Confirmed 2026-09-30, all four values, by direct app before/after
+  # writes. Register 0x0072 LOW byte.
+  - platform: template
+    name: "Grid Connected Mode"
+    id: grid_connected_mode
+    options:
+      - "Hybrid Mode"
+      - "Grid Connected Power Supply Mode"
+      - "Off Grid Mode"
+      - "Grid Connected Anti Backflow Mode"
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(grid_connected_mode_num).state)) return {};
+      int val = id(grid_connected_mode_num).state;
+      if (val == 0) return std::string("Hybrid Mode");
+      if (val == 1) return std::string("Grid Connected Power Supply Mode");
+      if (val == 2) return std::string("Off Grid Mode");
+      if (val == 3) return std::string("Grid Connected Anti Backflow Mode");
+      return std::string("Unknown");
+    set_action:
+      - number.set:
+          id: grid_connected_mode_num
+          value: !lambda |-
+            if (x == "Hybrid Mode") return 0;
+            if (x == "Grid Connected Power Supply Mode") return 1;
+            if (x == "Off Grid Mode") return 2;
+            if (x == "Grid Connected Anti Backflow Mode") return 3;
+            return 3;
+
+  - platform: template
+    name: "Setting: Charging Priority"
+    id: setting_charger_priority
+    options:
+      - "SNU (PV + Mains)"
+      - "OSO (Only Solar)"
+      - "CSO (PV Priority)"
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(setting_charger_priority_num).state)) return {};
+      int val = id(setting_charger_priority_num).state;
+      if (val == 0) return std::string("SNU (PV + Mains)");
+      if (val == 1) return std::string("OSO (Only Solar)");
+      if (val == 2) return std::string("CSO (PV Priority)");
+      return std::string("SNU (PV + Mains)");
+    set_action:
+      - number.set:
+          id: setting_charger_priority_num
+          value: !lambda |-
+            if (x == "SNU (PV + Mains)") return 0;
+            if (x == "OSO (Only Solar)") return 1;
+            if (x == "CSO (PV Priority)") return 2;
+            return 0;
+
+  - platform: template
+    name: "Setting A17: BMS Protocol"
+    id: setting_bms_protocol
+    options:
+      - "0: User/None"
+      - "1: PYLON"
+      - "5: PACE"
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(setting_bms_protocol_num).state)) return {};
+      int val = id(setting_bms_protocol_num).state;
+      if (val == 0) return std::string("0: User/None");
+      if (val == 1) return std::string("1: PYLON");
+      if (val == 5) return std::string("5: PACE");
+      return std::to_string(val) + ": Other";
+    set_action:
+      - number.set:
+          id: setting_bms_protocol_num
+          value: !lambda |-
+            if (x == "0: User/None") return 0;
+            if (x == "1: PYLON") return 1;
+            if (x == "5: PACE") return 5;
+            return 5;
+
+  # Read-only display of Load Priority Supply Mode. 2=PV and 3=Battery
+  # confirmed; not made settable from this select because the low byte
+  # of 0x0060 was never tested (see the number: entry's comment above).
+  # Use the app for now if you need to change this.
+  - platform: template
+    name: "Setting: Load Priority Supply Mode (read-only)"
+    id: setting_load_priority
+    options:
+      - "PV"
+      - "Battery"
+      - "Unknown"
+    update_interval: 5s
+    # optimistic can't be combined with lambda (lambda means the state
+    # is computed/read, not just assumed). set_action is required by
+    # the platform regardless, so this one just logs and does NOT write
+    # to 0x0060 — its low byte was never write-tested, so no real write
+    # action is wired up on purpose.
+    set_action:
+      - logger.log:
+          format: "Setting: Load Priority Supply Mode is read-only in ESPHome — use the app to change this."
+          level: WARN
+    lambda: |-
+      if (isnan(id(setting_load_priority_num).state)) return {};
+      int val = id(setting_load_priority_num).state;
+      if (val == 2) return std::string("PV");
+      if (val == 3) return std::string("Battery");
+      return std::string("Unknown");
+
+sensor:
+  # ====================================================
+  # VERIFIED WORKING TELEMETRY REGISTERS — unchanged this session.
+  # ====================================================
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0000
+    name: "Raw Reg 0x0000"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0000
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0001
+    name: "Raw Reg 0x0001"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0001
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0002
+    name: "Raw Reg 0x0002"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0002
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0003
+    name: "Raw Reg 0x0003"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0003
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: raw_reg_0004
+    name: "Real-Time DC Bus Voltage"
+    address: 0x0004
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: grid_voltage
+    name: "Grid Voltage"
+    address: 0x0005
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    filters:
+      - lambda: "return x < 20 ? 0.0f : x;"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0006
+    name: "Raw Reg 0x0006"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0006
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0007
+    name: "Raw Reg 0x0007"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0007
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: batt_v
+    name: "Battery Voltage"
+    address: 0x0008
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0009
+    name: "Raw Reg 0x0009"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0009
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_000A
+    name: "Raw Reg 0x000A"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x000A
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: pv1_current
+    name: "PV1 Current"
+    address: 0x000B
+    register_type: holding
+    value_type: U_WORD
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - lambda: "return x <= 0.3f ? 0.0f : x;"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: pv1_voltage
+    name: "PV1 Voltage"
+    address: 0x000C
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - lambda: "return x < 20.0f ? 0.0f : x;"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: pv2_current
+    name: "PV2 Current"
+    address: 0x000D
+    register_type: holding
+    value_type: U_WORD
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - lambda: "return x <= 0.3f ? 0.0f : x;"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: pv2_voltage
+    name: "PV2 Voltage"
+    address: 0x000E
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - lambda: "return x < 20.0f ? 0.0f : x;"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_000F
+    name: "MPPT Heatsink Temp"
+    address: 0x000F
+    register_type: holding
+    value_type: U_WORD
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0010
+    name: "Battery Temp (Inverter Sensor)"
+    address: 0x0010
+    register_type: holding
+    value_type: U_WORD
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: batt_net_current
+    name: "Battery Charge Current"
+    address: 0x0011
+    register_type: holding
+    value_type: S_WORD
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: grid_frequency
+    name: "Grid Frequency"
+    address: 0x0012
+    register_type: holding
+    value_type: U_WORD
+    device_class: frequency
+    state_class: measurement
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0013
+    name: "Raw Reg 0x0013"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0013
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0014
+    name: "Raw Reg 0x0014"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0014
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: raw_reg_0015
+    name: "Raw Reg 0x0015"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0015
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: raw_reg_0016
+    name: "Raw Reg 0x0016"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0016
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: raw_reg_0017
+    name: "Status Word 0x0017"
+    address: 0x0017
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0018
+    name: "Raw Reg 0x0018"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0018
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0019
+    name: "Raw Reg 0x0019"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0019
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    id: ac_output_active_power
+    name: "AC Output Active Power"
+    address: 0x0020
+    register_type: holding
+    value_type: U_WORD
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0021
+    name: "Raw Reg 0x0021"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0021
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0022
+    name: "Raw Reg 0x0022"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0022
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0023
+    name: "Raw Reg 0x0023"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0023
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0024
+    name: "Raw Reg 0x0024"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0024
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0025
+    name: "Raw Reg 0x0025"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0025
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0026
+    name: "Raw Reg 0x0026"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0026
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0027
+    name: "Raw Reg 0x0027"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0027
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0028
+    name: "Raw Reg 0x0028"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0028
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0029
+    name: "Internal DC Bus Voltage (Static)"
+    address: 0x0029
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_002A
+    name: "Raw Reg 0x002A"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x002A
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_002B
+    name: "Raw Reg 0x002B"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x002B
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_002C
+    name: "Raw Reg 0x002C"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x002C
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_002D
+    name: "Raw Reg 0x002D"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x002D
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_002E
+    name: "Raw Reg 0x002E"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x002E
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_002F
+    name: "Raw Reg 0x002F"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x002F
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0030
+    name: "BMS Pack Voltage"
+    address: 0x0030
+    register_type: holding
+    value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    filters: [multiply: 0.01]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0031
+    name: "BMS Pack Current"
+    address: 0x0031
+    register_type: holding
+    value_type: S_WORD
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    filters: [multiply: 0.01]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0032
+    name: "Raw Reg 0x0032"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0032
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0033
+    name: "BMS State of Charge"
+    address: 0x0033
+    register_type: holding
+    value_type: U_WORD
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0034
+    name: "BMS Remaining Capacity"
+    address: 0x0034
+    register_type: holding
+    value_type: U_WORD
+    device_class: energy_storage
+    state_class: measurement
+    unit_of_measurement: "Ah"
+    accuracy_decimals: 2
+    filters: [multiply: 0.01]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0035
+    name: "BMS Total Capacity"
+    address: 0x0035
+    register_type: holding
+    value_type: U_WORD
+    device_class: energy_storage
+    state_class: measurement
+    unit_of_measurement: "Ah"
+    accuracy_decimals: 2
+    filters: [multiply: 0.01]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0036
+    name: "Raw Reg 0x0036"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0036
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0037
+    name: "Raw Reg 0x0037"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0037
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0038
+    name: "Raw Reg 0x0038"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0038
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0039
+    name: "PV1 Total Generation"
+    address: 0x0039
+    register_type: holding
+    value_type: U_WORD
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 0
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_003A
+    name: "PV2 Total Generation"
+    address: 0x003A
+    register_type: holding
+    value_type: U_WORD
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 0
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_003B
+    name: "Raw Reg 0x003B"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x003B
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_003C
+    name: "Raw Reg 0x003C"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x003C
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_003D
+    name: "Raw Reg 0x003D"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x003D
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_003E
+    name: "Raw Reg 0x003E (possibly Total Output Energy)"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x003E
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_003F
+    name: "Raw Reg 0x003F (possibly Total Input Energy)"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x003F
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0040
+    name: "Raw Reg 0x0040"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0040
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: raw_reg_0041
+    name: "Raw Reg 0x0041"
+    disabled_by_default: true
+    entity_category: diagnostic
+    address: 0x0041
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Rated Output Power"
+    id: rated_output_power
+    address: 0x0061
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "W"
+    entity_category: diagnostic
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting: Output Voltage"
+    id: setting_output_voltage
+    address: 0x0062
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    entity_category: diagnostic
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting: Output Frequency"
+    id: setting_output_frequency
+    address: 0x0062
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "Hz"
+    entity_category: diagnostic
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting: AC Input Voltage Range"
+    id: setting_ac_input_voltage_range
+    address: 0x0066
+    register_type: holding
+    value_type: U_WORD
+    entity_category: diagnostic
+    # Confirmed real, standard SRNE setting (item [03] on the generic
+    # LCD numbering) — a genuine wide/narrow input-tolerance preset,
+    # not a broken or vestigial one. hi=0 -> "165V-280V" (narrow),
+    # hi=1 -> "120V-280V" (wide), confirmed by direct write test.
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting 0x0069 (voltage, unidentified)"
+    disabled_by_default: true
+    id: setting_v_0069
+    address: 0x0069
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting 0x006A (voltage, unidentified)"
+    disabled_by_default: true
+    id: setting_v_006a
+    address: 0x006A
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting 0x006C (voltage, unidentified)"
+    disabled_by_default: true
+    id: setting_v_006c
+    address: 0x006C
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "Setting 0x006D (voltage, unidentified)"
+    disabled_by_default: true
+    id: setting_v_006d
+    address: 0x006D
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters: [multiply: 0.1]
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "MPPT1 Target Voltage"
+    id: mppt1_target_voltage
+    address: 0x001C
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters: [multiply: 0.1]
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    name: "MPPT2 Target Voltage"
+    id: mppt2_target_voltage
+    address: 0x001D
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters: [multiply: 0.1]
+
+  # ====================================================
+  # TEMPLATE SENSORS — unchanged this session.
+  # ====================================================
+  - platform: template
+    name: "PV1 Power"
+    id: pv1_power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(pv1_voltage).has_state() && id(pv1_current).has_state()) {
+        return max(0.0f, id(pv1_voltage).state * id(pv1_current).state);
+      }
+      return 0.0f;
+
+  - platform: template
+    name: "PV2 Power"
+    id: pv2_power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(pv2_voltage).has_state() && id(pv2_current).has_state()) {
+        return max(0.0f, id(pv2_voltage).state * id(pv2_current).state);
+      }
+      return 0.0f;
+
+  - platform: template
+    name: "Total PV Power"
+    id: total_pv_power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      float p1 = (id(pv1_voltage).has_state() && id(pv1_current).has_state()) ? max(0.0f, id(pv1_voltage).state * id(pv1_current).state) : 0.0f;
+      float p2 = (id(pv2_voltage).has_state() && id(pv2_current).has_state()) ? max(0.0f, id(pv2_voltage).state * id(pv2_current).state) : 0.0f;
+      return p1 + p2;
+
+  - platform: template
+    name: "PV1 Contribution"
+    id: pv1_contribution
+    unit_of_measurement: "%"
+    icon: "mdi:solar-power"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      static float last_val_1 = -1.0f;
+      float target_val = 0.0f;
+      float max_slew = 0.5f;
+      if (id(pv1_power).has_state() && id(pv2_power).has_state()) {
+        float p1 = id(pv1_power).state;
+        float p2 = id(pv2_power).state;
+        float sum = p1 + p2;
+        if (sum > 5.0f) {
+          target_val = (p1 / sum) * 100.0f;
+        }
+      }
+      if (last_val_1 < 0.0f && target_val > 0.0f) {
+         last_val_1 = target_val;
+         return target_val;
+      } else if (last_val_1 < 0.0f) {
+         return 0.0f;
+      }
+      if (target_val > last_val_1 + max_slew) {
+        last_val_1 += max_slew;
+      } else if (target_val < last_val_1 - max_slew) {
+        last_val_1 -= max_slew;
+      } else {
+        last_val_1 = target_val;
+      }
+      return last_val_1;
+
+  - platform: template
+    name: "PV2 Contribution"
+    id: pv2_contribution
+    unit_of_measurement: "%"
+    icon: "mdi:solar-power"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      static float last_val_2 = -1.0f;
+      float target_val = 0.0f;
+      float max_slew = 0.5f;
+      if (id(pv1_power).has_state() && id(pv2_power).has_state()) {
+        float p1 = id(pv1_power).state;
+        float p2 = id(pv2_power).state;
+        float sum = p1 + p2;
+        if (sum > 5.0f) {
+          target_val = (p2 / sum) * 100.0f;
+        }
+      }
+      if (last_val_2 < 0.0f && target_val > 0.0f) {
+         last_val_2 = target_val;
+         return target_val;
+      } else if (last_val_2 < 0.0f) {
+         return 0.0f;
+      }
+      if (target_val > last_val_2 + max_slew) {
+        last_val_2 += max_slew;
+      } else if (target_val < last_val_2 - max_slew) {
+        last_val_2 -= max_slew;
+      } else {
+        last_val_2 = target_val;
+      }
+      return last_val_2;
+
+  - platform: template
+    name: "Battery Power"
+    id: battery_power_net
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(batt_v).has_state() && id(batt_net_current).has_state()) {
+        return id(batt_v).state * id(batt_net_current).state;
+      }
+      return {};
+
+  - platform: template
+    name: "Inverter Load Percentage"
+    id: inverter_load_pct
+    unit_of_measurement: "%"
+    icon: "mdi:gauge"
+    state_class: measurement
+    accuracy_decimals: 1
+    lambda: |-
+      if (id(ac_output_active_power).has_state()) {
+        return (id(ac_output_active_power).state / 6300.0f) * 100.0f;
+      }
+      return {};
+
+binary_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    name: "Grid Present"
+    id: grid_present
+    address: 0x0017
+    register_type: holding
+    bitmask: 0x0004
+    device_class: power
+  # NOTE: this bit stays False whenever the grid is present and healthy,
+  # regardless of Grid Connected Mode — it reflects bypass-vs-invert,
+  # not which charging mode is active. Confirmed this session.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_fast
+    name: "Inverter Output Active"
+    id: inverter_output_active
+    address: 0x0017
+    register_type: holding
+    bitmask: 0x0100
+    device_class: running
