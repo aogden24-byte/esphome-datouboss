@@ -31,6 +31,11 @@ Serial settings: 9600 baud, 8N1, Modbus slave address 1. The package polls as a 
 
 Raw and unidentified registers are included but disabled by default in Home Assistant; enable them from the device page if you want to help map more of them.
 
+### Package entities beyond the register map
+
+- **Grid Charging** (switch): sets SNU, the wide input range, Hybrid mode and PV output priority, then raises Priority Inverter To Mains Supply SOC above the current SOC so the inverter charges from mains until **Grid Charging Target SOC**; it switches itself off at the target or above 1500 W load. Off restores OSO, the narrow range, Off Grid and Battery priority.
+- **Neutral Grounding** and **Battery Free Mode** are deliberately read-only.
+
 ## Register map
 
 Mapped 2026-10-10 by pressing **Read** on each row of the Solar of Things portal's control page while sniffing the bus: every row sends one Modbus read of its register, which ties each setting's name to an address and value. Earlier entries were confirmed by write tests.
@@ -82,7 +87,7 @@ The portal labels battery protocols by transliterated Chinese brand names: Guriw
 
 > **Neutral Grounding** closes the inverter's internal neutral–ground bond relay. If your system is already bonded at the main panel (normal in North America), setting it creates a second bond and puts neutral current on the ground conductor. Do not toggle it to test it.
 
-**Corrections to earlier versions of this README:** `0x0088` high byte is the shutdown SOC, not the BMS protocol (the protocol is the low byte, and PACE = 4). `0x0067` is Equalization Voltage, not Charge Disconnect Voltage. `0x006B` is Battery High Voltage Recovery, not bulk voltage. `0x006E` is Battery Low Voltage Recovery, not grid charge enable. The `0x0087` high byte is the BMS address, not a fixed `0x01`. The package YAML still uses the old entity names; it will be updated to match.
+**Corrections to earlier versions of this README:** `0x0088` high byte is the shutdown SOC, not the BMS protocol (the protocol is the low byte, and PACE = 4). `0x0067` is Equalization Voltage, not Charge Disconnect Voltage. `0x006B` is Battery High Voltage Recovery, not bulk voltage. `0x006E` is Battery Low Voltage Recovery, not grid charge enable. The `0x0087` high byte is the BMS address, not a fixed `0x01`. The package uses the corrected names from 2026-10-10; entities renamed in that update show as unavailable in Home Assistant and can be deleted.
 
 ## Telemetry
 

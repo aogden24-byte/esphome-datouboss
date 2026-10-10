@@ -48,9 +48,8 @@ modbus_controller:
 
 # ====================================================
 # INVERTER POWER SWITCH — confirmed 2026-09-30 via RS485 sniff.
-# Register 0x0087, low byte only: write 0x0100 for OFF, 0x0101 for ON.
-# High byte observed constant at 0x01 across every read regardless of
-# state, so it's hardcoded here rather than preserved via read-back.
+# Register 0x0087 LOW byte: 1 = on, 0 = off. The HIGH byte is the BMS
+# Lithium Battery Address (mapped 2026-10-10) and is preserved on write.
 # (The old 0xDF00 attempt is gone — that address was rejected outright
 # with Modbus exception 2 and never worked.)
 #
@@ -59,6 +58,12 @@ modbus_controller:
 # Do not add a second "number:" block — YAML/ESPHome will reject a
 # duplicate top-level key. Same rule for "switch:" and "select:".
 # ====================================================
+globals:
+  - id: gc_was_charging
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
 number:
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
@@ -71,7 +76,10 @@ number:
     max_value: 1
     step: 1
     lambda: "return (int)(((uint16_t)x) & 0xFF);"
-    write_lambda: "return (uint16_t)(0x0100 | ((uint16_t)x & 0xFF));"
+    write_lambda: |-
+      float raw_f = id(reg_0087_raw).state;
+      if (isnan(raw_f)) return NAN;
+      return (uint16_t)((((uint16_t) raw_f) & 0xFF00) | ((uint16_t)x & 0xFF));
 
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
@@ -136,11 +144,16 @@ number:
     max_value: 2
     step: 1
     lambda: "return (int)(((uint16_t)x) >> 8);"
-    write_lambda: "return (uint16_t)(((uint16_t)x << 8) | 0x00);"
+    # LOW byte = Battery Free Mode Selection (mapped 2026-10-10); preserved.
+    write_lambda: |-
+      float raw_f = id(reg_0063_raw).state;
+      if (isnan(raw_f)) return NAN;
+      return (uint16_t)(((uint16_t)x << 8) | (((uint16_t) raw_f) & 0xFF));
 
-  # Untouched this session; label meaning ("PACE") confirmed correct by
-  # you against the real manual, but the underlying numeric value was
-  # never independently re-verified with a fresh write test.
+  # 0x0088 LOW byte = A17 BMS protocol (0 Lead-acid, 1 Growatt,
+  # 2 Voltronic, 3 Pylontech, 4 PACE, 5 Pylontech-A). HIGH byte =
+  # Lithium Battery Shutdown SOC (mapped 2026-10-10). Each write keeps
+  # the other byte.
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_bms_protocol_num
@@ -149,37 +162,41 @@ number:
     value_type: U_WORD
     internal: true
     min_value: 0
-    max_value: 10
+    max_value: 5
     step: 1
-    lambda: "return (int)(((uint16_t)x) >> 8);"
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
     write_lambda: |-
-      float batt_type_f = id(setting_battery_type_num).state;
-      if (isnan(batt_type_f)) return NAN;
-      uint16_t batt_type = (uint16_t) batt_type_f;
-      return (uint16_t)(((uint16_t)x << 8) | (batt_type & 0xFF));
+      float hi_f = id(setting_0088_hi_num).state;
+      if (isnan(hi_f)) return NAN;
+      uint16_t hi = (uint16_t) hi_f;
+      return (uint16_t)((hi << 8) | ((uint16_t)x & 0xFF));
 
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
-    id: setting_battery_type_num
+    id: setting_0088_hi_num
+    name: "Setting: Lithium Battery Shutdown SOC"
     address: 0x0088
     register_type: holding
     value_type: U_WORD
-    internal: true
+    unit_of_measurement: "%"
+    mode: box
     min_value: 0
-    max_value: 10
+    max_value: 100
     step: 1
-    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    lambda: "return (int)(((uint16_t)x) >> 8);"
     write_lambda: |-
       float proto_f = id(setting_bms_protocol_num).state;
       if (isnan(proto_f)) return NAN;
       uint16_t proto = (uint16_t) proto_f;
-      return (uint16_t)(((uint16_t)proto << 8) | ((uint16_t)x & 0xFF));
+      return (uint16_t)(((uint16_t)x << 8) | (proto & 0xFF));
 
-  # Confirmed correct as-is by direct write test (12A -> 13A).
+  # A16 / portal "HFP Grid Connected Current": export current limit,
+  # A = W / 120 V. HIGH byte; write confirmed (12 A -> 13 A). LOW byte =
+  # Neutral Grounding, preserved on write (never change it from here).
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_ac_input_limit
-    name: "Setting A16: Master AC Input Limit"
+    name: "Setting A16: HFP Grid-Connected Current (Export Limit)"
     address: 0x0075
     register_type: holding
     value_type: U_WORD
@@ -188,7 +205,10 @@ number:
     max_value: 60
     step: 1
     lambda: "return (int)(((uint16_t)x) >> 8);"
-    write_lambda: "return (uint16_t)(((uint16_t)x << 8) | 0x00);"
+    write_lambda: |-
+      float raw_f = id(reg_0075_raw).state;
+      if (isnan(raw_f)) return NAN;
+      return (uint16_t)(((uint16_t)x << 8) | (((uint16_t) raw_f) & 0xFF));
 
   # Confirmed 2026-09-30 by direct write test — corrected from the old
   # "AC Charge Start/Stop SOC" guess, which was the wrong meaning at the
@@ -196,7 +216,8 @@ number:
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_mains_supply_soc
-    name: "Setting: Priority Inverter To Mains Supply SOC"
+    name: "Grid Start SOC"
+    mode: box
     address: 0x008A
     register_type: holding
     value_type: U_WORD
@@ -214,7 +235,8 @@ number:
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_battery_powered_soc
-    name: "Setting: Priority Inverter To Battery Powered SOC"
+    name: "Grid Off SOC"
+    mode: box
     address: 0x008A
     register_type: holding
     value_type: U_WORD
@@ -246,7 +268,7 @@ number:
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_bulk_voltage
-    name: "Setting: Max Charge and Bulk Voltage (role unclear)"
+    name: "Setting: Battery High Voltage Recovery"
     address: 0x006B
     register_type: holding
     value_type: U_WORD
@@ -257,23 +279,20 @@ number:
     lambda: "return x * 0.1;"
     write_lambda: "return (uint16_t)(x * 10.0);"
 
-  # Register confirmed correct (write lands, echoes correctly). BUT:
-  # tested twice this session with the battery sitting several minutes,
-  # comfortably above this threshold, in two different Grid Connected
-  # Modes — charging never responded. Address is right; whether this
-  # setting actually does anything on this firmware is now in serious
-  # doubt.
+  # 0x0067 is Equalization Voltage (mapped 2026-10-10). It was first
+  # labelled "Charge Disconnect Voltage", which is why charging never
+  # responded to it.
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_charge_disconnect_v
-    name: "Setting: Charge Disconnect Voltage"
+    name: "Setting: Equalization Voltage"
     address: 0x0067
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "V"
     mode: box
-    min_value: 45.0
-    max_value: 56.8
+    min_value: 48.0
+    max_value: 60.0
     step: 0.1
     lambda: "return x * 0.1;"
     write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
@@ -313,11 +332,11 @@ number:
     lambda: "return x * 0.1;"
     write_lambda: "return (uint16_t)(x * 10.0);"
 
-  # Untouched this session — still an inherited guess, never tested.
+  # 0x006E Battery Low Voltage Recovery (mapped 2026-10-10).
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_grid_charge_enable_v
-    name: "Setting: Grid Charge Enable Voltage (unconfirmed)"
+    name: "Setting: Battery Low Voltage Recovery"
     address: 0x006E
     register_type: holding
     value_type: U_WORD
@@ -331,24 +350,226 @@ number:
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_max_charge_current
-    name: "Setting: Max Total Charge Current"
+    name: "Setting A13: Max Charging Current (PV + Mains)"
     address: 0x0064
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "A"
+    min_value: 5
+    max_value: 120
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float lo_f = id(setting_mains_charge_current).state;
+      if (isnan(lo_f)) return NAN;
+      return (uint16_t)(((uint16_t)x << 8) | ((uint16_t)lo_f & 0xFF));
+
+  # A12 Mains charging current = 0x0064 LOW byte (read 10, matching the
+  # app's "Mains Maximum Charging Current" tile; ~10 A gave ~520 W into
+  # the battery). Value match only - first write is the confirmation.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_mains_charge_current
+    name: "Setting A12: Mains Charging Current"
+    address: 0x0064
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    min_value: 5
+    max_value: 80
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: |-
+      float hi_f = id(setting_max_charge_current).state;
+      if (isnan(hi_f)) return NAN;
+      return (uint16_t)(((uint16_t)hi_f << 8) | ((uint16_t)x & 0xFF));
+
+  # 0x0089: HIGH byte = A23 charge cut-off SOC, LOW byte = A20 low-voltage
+  # recover SOC. Read 100 / 15 (both match the manual's defaults).
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_a23_soc
+    name: "Setting A23: Charge Cut-off SOC"
+    address: 0x0089
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 100
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float lo_f = id(setting_a20_soc).state;
+      if (isnan(lo_f)) return NAN;
+      return (uint16_t)(((uint16_t)x << 8) | ((uint16_t)lo_f & 0xFF));
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_a20_soc
+    name: "Setting A20: Low-Voltage Recover SOC"
+    address: 0x0089
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 90
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: |-
+      float hi_f = id(setting_a23_soc).state;
+      if (isnan(hi_f)) return NAN;
+      return (uint16_t)(((uint16_t)hi_f << 8) | ((uint16_t)x & 0xFF));
+
+  # ---- Battery voltage protection (mapped 2026-10-10) ----
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_hv_protection
+    name: "Setting: Battery High Voltage Protection"
+    address: 0x0069
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 50.0
+    max_value: 70.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_hv_alarm
+    name: "Setting: Battery High Voltage Alarm"
+    address: 0x006A
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 50.0
+    max_value: 70.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_lv_protection
+    name: "Setting: Battery Low Voltage Protection"
+    address: 0x006C
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 40.0
+    max_value: 52.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_lv_alarm
+    name: "Setting: Battery Low Voltage Alarm"
+    address: 0x006D
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 40.0
+    max_value: 52.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  # ---- Built-in output cutoff (mapped 2026-10-10; 0 = disabled) ----
+  # Whole registers; 0.1 V scaling assumed like every other voltage
+  # register. Check the value on the portal after the first write.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_output_off_v
+    name: "Setting: Output Off Battery Voltage"
+    address: 0x0076
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 0
+    max_value: 60.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_output_restore_v
+    name: "Setting: Output Restore Battery Voltage"
+    address: 0x0077
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 0
+    max_value: 60.0
+    step: 0.1
+    lambda: "return x * 0.1;"
+    write_lambda: "return (uint16_t)(x * 10.0f + 0.5f);"
+
+  # 0x0078 HIGH byte = Restore Main Output SOC, LOW byte = Turn Off Main
+  # Output SOC. Byte order inferred from the portal's list order (both
+  # read 0); check the portal after the first write.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_restore_output_soc
+    name: "Setting: Restore Main Output SOC"
+    address: 0x0078
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    mode: box
     min_value: 0
     max_value: 100
-    step: 5
+    step: 1
     lambda: "return (int)(((uint16_t)x) >> 8);"
-    write_lambda: "return (uint16_t)(((uint16_t)x << 8) | 0x0A);"
+    write_lambda: |-
+      float lo_f = id(setting_turnoff_output_soc).state;
+      if (isnan(lo_f)) return NAN;
+      return (uint16_t)(((uint16_t)x << 8) | ((uint16_t)lo_f & 0xFF));
 
-  # Confirmed 2026-09-30: only two of these four values were directly
-  # observed by real app before/after writes — 2=PV, 3=Battery. "Grid"
-  # was never tested; not writable until confirmed (see select below).
-  # Read-only: 0x0060's low byte was never write-tested, so no
-  # write_lambda is defined here — writing to this number would send a
-  # low byte of 0x00 and could clobber whatever that half actually
-  # controls. Change this setting from the app until that's confirmed.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_turnoff_output_soc
+    name: "Setting: Turn Off Main Output SOC"
+    address: 0x0078
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 0
+    max_value: 100
+    step: 1
+    lambda: "return (int)(((uint16_t)x) & 0xFF);"
+    write_lambda: |-
+      float hi_f = id(setting_restore_output_soc).state;
+      if (isnan(hi_f)) return NAN;
+      return (uint16_t)(((uint16_t)hi_f << 8) | ((uint16_t)x & 0xFF));
+
+  # Target SOC for Grid Charging (stored on the ESP32, not the inverter).
+  - platform: template
+    id: grid_charge_target
+    name: "Grid Charging Target SOC"
+    icon: "mdi:battery-arrow-up"
+    unit_of_measurement: "%"
+    min_value: 50
+    max_value: 99
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 95
+
+  # 0x0060 HIGH byte = A0 Output Priority. Confirmed by app writes:
+  # 2 = PV, 3 = PBG (battery). GRD (mains) value not yet observed; see
+  # the "Output Priority Raw Value" sensor after setting GRD on the LCD.
+  # LOW byte has read 0 in every capture; it is preserved on write.
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: setting_load_priority_num
@@ -356,11 +577,50 @@ number:
     register_type: holding
     value_type: U_WORD
     internal: true
-    min_value: 2
+    min_value: 0
     max_value: 3
     step: 1
     lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float raw_f = id(reg_0060_raw).state;
+      if (isnan(raw_f)) return NAN;
+      uint16_t low = ((uint16_t) raw_f) & 0xFF;
+      return (uint16_t)(((uint16_t)x << 8) | low);
 
+
+  # A14 AC input voltage range, 0x0066 HIGH byte. 0 = narrow (a 120 V
+  # grid is treated as out of range, so loads run on battery and mains
+  # is never used), 1 = wide (grid accepted: mains passthrough and grid
+  # charging possible). Low byte (reads 0x30) is preserved on write.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: setting_ac_input_range_num
+    address: 0x0066
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    lambda: "return (int)(((uint16_t)x) >> 8);"
+    write_lambda: |-
+      float raw_f = id(reg_0066_raw).state;
+      if (isnan(raw_f)) return NAN;
+      uint16_t low = ((uint16_t) raw_f) & 0xFF;
+      return (uint16_t)(((uint16_t)x << 8) | low);
+
+  # Whole 0x008A word (A21 high byte, A22 low byte), so Grid Charging can
+  # set both thresholds in ONE write instead of two back-to-back writes.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: soc_pair_raw
+    address: 0x008A
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    min_value: 0
+    max_value: 65535
+    step: 1
 switch:
   - platform: template
     name: "Inverter Power Switch"
@@ -428,6 +688,129 @@ switch:
 # ====================================================
 # SETTINGS MENUS
 # ====================================================
+
+  # Grid Charging. Confirmed 2026-10-02: with A0 = PV, the SOC switchover
+  # thresholds act live - A21 ("Inverter To Mains Supply SOC") set ABOVE
+  # the current SOC hands over to mains and, with SNU, starts a mains
+  # charge within seconds; A22 ("Inverter To Battery Powered SOC") set
+  # BELOW the current SOC hands back to battery and stops it. No output
+  # restart needed.
+  # ON: SNU, wide AC input range (A14), Hybrid, A0 = PV, A22 = target,
+  #     A21 = SOC + 3 (kept below target). The inverter itself hands back
+  #     to battery when SOC reaches the target; the switch then turns off.
+  # OFF: A22 = 5 (stops any running charge), A21 = 10, A22 = 80, OSO,
+  #     narrow A14, Off Grid, A0 = PBG.
+  # Refuses to start, and auto-switches off, above 1500 W output.
+  - platform: template
+    name: "Grid Charging"
+    id: grid_charging
+    icon: "mdi:transmission-tower-import"
+    optimistic: false
+    restore_mode: DISABLED
+    lambda: |-
+      float pri = id(setting_charger_priority_num).state;
+      float rng = id(setting_ac_input_range_num).state;
+      if (isnan(pri) || isnan(rng)) return {};
+      return pri < 0.5 && rng > 0.5;
+    turn_on_action:
+      - if:
+          condition:
+            lambda: |-
+              float soc = id(raw_reg_0033).state;
+              return id(ac_output_active_power).state > 1500 || isnan(soc) ||
+                     soc + 2 >= id(grid_charge_target).state;
+          then:
+            - logger.log:
+                format: "Grid Charging refused: load above 1500 W, SOC unknown, or within 2 percent of target"
+                level: WARN
+          else:
+            # One write per register, 5 s apart, skipping values already
+            # set: rapid back-to-back writes were being dropped.
+            - if:
+                condition:
+                  lambda: 'return id(setting_charger_priority_num).state != 0;'
+                then:
+                  - number.set:
+                      id: setting_charger_priority_num
+                      value: 0
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(setting_ac_input_range_num).state != 1;'
+                then:
+                  - number.set:
+                      id: setting_ac_input_range_num
+                      value: 1
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(grid_connected_mode_num).state != 0;'
+                then:
+                  - number.set:
+                      id: grid_connected_mode_num
+                      value: 0
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(setting_load_priority_num).state != 2;'
+                then:
+                  - number.set:
+                      id: setting_load_priority_num
+                      value: 2
+                  - delay: 5s
+            # A21 = SOC + 3 (below target), A22 = target, in a single write.
+            - number.set:
+                id: soc_pair_raw
+                value: !lambda |-
+                  int tgt = (int) id(grid_charge_target).state;
+                  int a21 = (int) id(raw_reg_0033).state + 3;
+                  if (a21 > tgt - 1) a21 = tgt - 1;
+                  return (float)((a21 << 8) | (tgt & 0xFF));
+            - logger.log: "Grid Charging on: A21 above SOC, mains charge should start"
+    turn_off_action:
+      # A21 = 10, A22 = 5 in one write: A22 below SOC hands back to battery
+      # immediately, stopping any running charge.
+      - number.set:
+          id: soc_pair_raw
+          value: !lambda 'return (float)((10 << 8) | 5);'
+      - delay: 5s
+      - number.set:
+          id: soc_pair_raw
+          value: !lambda 'return (float)((10 << 8) | 80);'
+      - delay: 5s
+      - if:
+          condition:
+            lambda: 'return id(setting_charger_priority_num).state != 1;'
+          then:
+            - number.set:
+                id: setting_charger_priority_num
+                value: 1
+            - delay: 5s
+      - if:
+          condition:
+            lambda: 'return id(setting_ac_input_range_num).state != 0;'
+          then:
+            - number.set:
+                id: setting_ac_input_range_num
+                value: 0
+            - delay: 5s
+      - if:
+          condition:
+            lambda: 'return id(grid_connected_mode_num).state != 2;'
+          then:
+            - number.set:
+                id: grid_connected_mode_num
+                value: 2
+            - delay: 5s
+      - if:
+          condition:
+            lambda: 'return id(setting_load_priority_num).state != 3;'
+          then:
+            - number.set:
+                id: setting_load_priority_num
+                value: 3
+      - logger.log: "Grid Charging off: normal settings restored"
+
 select:
   # Confirmed 2026-09-30, all four values, by direct app before/after
   # writes. Register 0x0072 LOW byte.
@@ -482,59 +865,147 @@ select:
             if (x == "CSO (PV Priority)") return 2;
             return 0;
 
+  # A17 per the manual. 4 (PAC) is confirmed as this unit's original
+  # value; the rest follow the manual/app list order.
   - platform: template
     name: "Setting A17: BMS Protocol"
     id: setting_bms_protocol
     options:
-      - "0: User/None"
-      - "1: PYLON"
-      - "5: PACE"
+      - "Pb (Lead-acid)"
+      - "GRO (Growatt)"
+      - "VLO (Voltronic)"
+      - "PYL (Pylon)"
+      - "PAC (PACE)"
+      - "PYL (Pylon, alt)"
     update_interval: 5s
     lambda: |-
       if (isnan(id(setting_bms_protocol_num).state)) return {};
       int val = id(setting_bms_protocol_num).state;
-      if (val == 0) return std::string("0: User/None");
-      if (val == 1) return std::string("1: PYLON");
-      if (val == 5) return std::string("5: PACE");
-      return std::to_string(val) + ": Other";
+      switch (val) {
+        case 0: return std::string("Pb (Lead-acid)");
+        case 1: return std::string("GRO (Growatt)");
+        case 2: return std::string("VLO (Voltronic)");
+        case 3: return std::string("PYL (Pylon)");
+        case 4: return std::string("PAC (PACE)");
+        case 5: return std::string("PYL (Pylon, alt)");
+      }
+      return {};
     set_action:
       - number.set:
           id: setting_bms_protocol_num
           value: !lambda |-
-            if (x == "0: User/None") return 0;
-            if (x == "1: PYLON") return 1;
-            if (x == "5: PACE") return 5;
+            if (x == "Pb (Lead-acid)") return 0;
+            if (x == "GRO (Growatt)") return 1;
+            if (x == "VLO (Voltronic)") return 2;
+            if (x == "PYL (Pylon)") return 3;
+            if (x == "PAC (PACE)") return 4;
             return 5;
 
-  # Read-only display of Load Priority Supply Mode. 2=PV and 3=Battery
-  # confirmed; not made settable from this select because the low byte
-  # of 0x0060 was never tested (see the number: entry's comment above).
-  # Use the app for now if you need to change this.
+  # A0 Output Priority, 0x0060 HIGH byte (LOW byte = ID Address).
+  # 2 = PV and 3 = PBG confirmed by app writes. 1 = Mains is inferred
+  # from the portal's option order (Mains, PV, Battery).
   - platform: template
-    name: "Setting: Load Priority Supply Mode (read-only)"
+    name: "Setting A0: Output Priority"
     id: setting_load_priority
     options:
+      - "Mains (unconfirmed)"
       - "PV"
-      - "Battery"
-      - "Unknown"
+      - "PBG (Battery)"
+      - "Other (see raw value)"
     update_interval: 5s
-    # optimistic can't be combined with lambda (lambda means the state
-    # is computed/read, not just assumed). set_action is required by
-    # the platform regardless, so this one just logs and does NOT write
-    # to 0x0060 — its low byte was never write-tested, so no real write
-    # action is wired up on purpose.
-    set_action:
-      - logger.log:
-          format: "Setting: Load Priority Supply Mode is read-only in ESPHome — use the app to change this."
-          level: WARN
     lambda: |-
       if (isnan(id(setting_load_priority_num).state)) return {};
       int val = id(setting_load_priority_num).state;
+      if (val == 1) return std::string("Mains (unconfirmed)");
       if (val == 2) return std::string("PV");
-      if (val == 3) return std::string("Battery");
-      return std::string("Unknown");
+      if (val == 3) return std::string("PBG (Battery)");
+      return std::string("Other (see raw value)");
+    set_action:
+      - if:
+          condition:
+            lambda: 'return x == "Mains (unconfirmed)" || x == "PV" || x == "PBG (Battery)";'
+          then:
+            - number.set:
+                id: setting_load_priority_num
+                value: !lambda 'return x == "PV" ? 2 : (x == "PBG (Battery)" ? 3 : 1);'
+          else:
+            - logger.log:
+                format: "Output Priority: value not mapped."
+                level: WARN
 
 sensor:
+  # Full words, used to preserve the other byte of split registers.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: reg_0063_raw
+    internal: true
+    address: 0x0063
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: reg_0075_raw
+    internal: true
+    address: 0x0075
+    register_type: holding
+    value_type: U_WORD
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: reg_0087_raw
+    internal: true
+    address: 0x0087
+    register_type: holding
+    value_type: U_WORD
+  - platform: template
+    name: "Setting: Battery Nominal Voltage"
+    unit_of_measurement: "V"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      if (isnan(id(reg_0066_raw).state)) return {};
+      return (float)(((uint16_t) id(reg_0066_raw).state) & 0xFF);
+  - platform: template
+    name: "Setting: BMS Lithium Battery Address"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      if (isnan(id(reg_0087_raw).state)) return {};
+      return (float)(((uint16_t) id(reg_0087_raw).state) >> 8);
+  - platform: template
+    name: "Setting: ID Address"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      if (isnan(id(reg_0060_raw).state)) return {};
+      return (float)(((uint16_t) id(reg_0060_raw).state) & 0xFF);
+  # Full 0x0066 word, used to preserve its low byte when writing A14.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: reg_0066_raw
+    internal: true
+    address: 0x0066
+    register_type: holding
+    value_type: U_WORD
+  # Full 0x0060 word, used to preserve its low byte when writing A0.
+  - platform: modbus_controller
+    modbus_controller_id: datouboss_slow
+    id: reg_0060_raw
+    internal: true
+    address: 0x0060
+    register_type: holding
+    value_type: U_WORD
+  - platform: template
+    name: "Output Priority Raw Value"
+    id: output_priority_raw
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 20s
+    lambda: |-
+      if (isnan(id(reg_0060_raw).state)) return {};
+      return (float)(((uint16_t) id(reg_0060_raw).state) >> 8);
+
   # ====================================================
   # VERIFIED WORKING TELEMETRY REGISTERS — unchanged this session.
   # ====================================================
@@ -543,7 +1014,6 @@ sensor:
     id: raw_reg_0000
     name: "Raw Reg 0x0000"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0000
     register_type: holding
     value_type: U_WORD
@@ -552,25 +1022,25 @@ sensor:
     id: raw_reg_0001
     name: "Raw Reg 0x0001"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0001
     register_type: holding
     value_type: U_WORD
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
-    id: raw_reg_0002
-    name: "Raw Reg 0x0002"
-    disabled_by_default: true
-    entity_category: diagnostic
+    id: ac_output_voltage
+    name: "AC Output Voltage"
     address: 0x0002
     register_type: holding
     value_type: U_WORD
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: raw_reg_0003
     name: "Raw Reg 0x0003"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0003
     register_type: holding
     value_type: U_WORD
@@ -599,24 +1069,33 @@ sensor:
     accuracy_decimals: 0
     filters:
       - lambda: "return x < 20 ? 0.0f : x;"
+  # Confirmed: 36 with a 439 W load at 122 V (3.6 A), 0 with output off.
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
-    id: raw_reg_0006
-    name: "Raw Reg 0x0006"
-    disabled_by_default: true
-    entity_category: diagnostic
+    id: ac_output_current
+    name: "AC Output Current"
     address: 0x0006
     register_type: holding
     value_type: U_WORD
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
+  # Likely, not fully confirmed: 0 with no grid draw, ~7 A while mains
+  # charging at ~720 W, ~1.3 A at idle (apparent current).
   - platform: modbus_controller
-    modbus_controller_id: datouboss_slow
-    id: raw_reg_0007
-    name: "Raw Reg 0x0007"
-    disabled_by_default: true
-    entity_category: diagnostic
+    modbus_controller_id: datouboss_fast
+    id: grid_input_current
+    name: "Grid Input Current"
     address: 0x0007
     register_type: holding
-    value_type: U_WORD
+    value_type: S_WORD
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters: [multiply: 0.1]
   - platform: modbus_controller
     modbus_controller_id: datouboss_fast
     id: batt_v
@@ -634,7 +1113,6 @@ sensor:
     id: raw_reg_0009
     name: "Raw Reg 0x0009"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0009
     register_type: holding
     value_type: U_WORD
@@ -643,7 +1121,6 @@ sensor:
     id: raw_reg_000A
     name: "Raw Reg 0x000A"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x000A
     register_type: holding
     value_type: U_WORD
@@ -660,7 +1137,10 @@ sensor:
     accuracy_decimals: 1
     filters:
       - multiply: 0.1
-      - lambda: "return x <= 0.3f ? 0.0f : x;"
+      # Calibration: the inverter reads ~0.3 A high on each string (seen as
+      # ghost current at night, and as ~100 W of PV that never reaches the
+      # battery). Subtract it and floor at 0. Replaces the old deadband.
+      - lambda: "return x > 0.3f ? x - 0.3f : 0.0f;"
   - platform: modbus_controller
     modbus_controller_id: datouboss_fast
     id: pv1_voltage
@@ -688,7 +1168,10 @@ sensor:
     accuracy_decimals: 1
     filters:
       - multiply: 0.1
-      - lambda: "return x <= 0.3f ? 0.0f : x;"
+      # Calibration: the inverter reads ~0.3 A high on each string (seen as
+      # ghost current at night, and as ~100 W of PV that never reaches the
+      # battery). Subtract it and floor at 0. Replaces the old deadband.
+      - lambda: "return x > 0.3f ? x - 0.3f : 0.0f;"
   - platform: modbus_controller
     modbus_controller_id: datouboss_fast
     id: pv2_voltage
@@ -754,7 +1237,6 @@ sensor:
     id: raw_reg_0013
     name: "Raw Reg 0x0013"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0013
     register_type: holding
     value_type: U_WORD
@@ -763,7 +1245,6 @@ sensor:
     id: raw_reg_0014
     name: "Raw Reg 0x0014"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0014
     register_type: holding
     value_type: U_WORD
@@ -772,7 +1253,6 @@ sensor:
     id: raw_reg_0015
     name: "Raw Reg 0x0015"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0015
     register_type: holding
     value_type: U_WORD
@@ -781,7 +1261,6 @@ sensor:
     id: raw_reg_0016
     name: "Raw Reg 0x0016"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0016
     register_type: holding
     value_type: U_WORD
@@ -797,7 +1276,6 @@ sensor:
     id: raw_reg_0018
     name: "Raw Reg 0x0018"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0018
     register_type: holding
     value_type: U_WORD
@@ -806,7 +1284,6 @@ sensor:
     id: raw_reg_0019
     name: "Raw Reg 0x0019"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0019
     register_type: holding
     value_type: U_WORD
@@ -821,12 +1298,25 @@ sensor:
     state_class: measurement
     unit_of_measurement: "W"
     accuracy_decimals: 0
+    # Guard (1500 W; the output restart transient reaches ~1.1 kW): big
+    # load (e.g. the AC unit) while grid charging would put
+    # load + charging on the mains circuit. Drop grid charging instead.
+    on_value_range:
+      - above: 1500
+        then:
+          - if:
+              condition:
+                switch.is_on: grid_charging
+              then:
+                - logger.log:
+                    format: "AC output above 1500 W: turning Grid Charging off"
+                    level: WARN
+                - switch.turn_off: grid_charging
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: raw_reg_0021
     name: "Raw Reg 0x0021"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0021
     register_type: holding
     value_type: U_WORD
@@ -835,7 +1325,6 @@ sensor:
     id: raw_reg_0022
     name: "Raw Reg 0x0022"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0022
     register_type: holding
     value_type: U_WORD
@@ -844,7 +1333,6 @@ sensor:
     id: raw_reg_0023
     name: "Raw Reg 0x0023"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0023
     register_type: holding
     value_type: U_WORD
@@ -853,7 +1341,6 @@ sensor:
     id: raw_reg_0024
     name: "Raw Reg 0x0024"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0024
     register_type: holding
     value_type: U_WORD
@@ -862,7 +1349,6 @@ sensor:
     id: raw_reg_0025
     name: "Raw Reg 0x0025"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0025
     register_type: holding
     value_type: U_WORD
@@ -871,7 +1357,6 @@ sensor:
     id: raw_reg_0026
     name: "Raw Reg 0x0026"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0026
     register_type: holding
     value_type: U_WORD
@@ -880,7 +1365,6 @@ sensor:
     id: raw_reg_0027
     name: "Raw Reg 0x0027"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0027
     register_type: holding
     value_type: U_WORD
@@ -889,7 +1373,6 @@ sensor:
     id: raw_reg_0028
     name: "Raw Reg 0x0028"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0028
     register_type: holding
     value_type: U_WORD
@@ -910,7 +1393,6 @@ sensor:
     id: raw_reg_002A
     name: "Raw Reg 0x002A"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x002A
     register_type: holding
     value_type: U_WORD
@@ -919,7 +1401,6 @@ sensor:
     id: raw_reg_002B
     name: "Raw Reg 0x002B"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x002B
     register_type: holding
     value_type: U_WORD
@@ -928,7 +1409,6 @@ sensor:
     id: raw_reg_002C
     name: "Raw Reg 0x002C"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x002C
     register_type: holding
     value_type: U_WORD
@@ -937,7 +1417,6 @@ sensor:
     id: raw_reg_002D
     name: "Raw Reg 0x002D"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x002D
     register_type: holding
     value_type: U_WORD
@@ -946,7 +1425,6 @@ sensor:
     id: raw_reg_002E
     name: "Raw Reg 0x002E"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x002E
     register_type: holding
     value_type: U_WORD
@@ -955,7 +1433,6 @@ sensor:
     id: raw_reg_002F
     name: "Raw Reg 0x002F"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x002F
     register_type: holding
     value_type: U_WORD
@@ -988,7 +1465,6 @@ sensor:
     id: raw_reg_0032
     name: "Raw Reg 0x0032"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0032
     register_type: holding
     value_type: U_WORD
@@ -1003,6 +1479,15 @@ sensor:
     state_class: measurement
     unit_of_measurement: "%"
     accuracy_decimals: 0
+    on_value:
+      - if:
+          condition:
+            and:
+              - switch.is_on: grid_charging
+              - lambda: 'return x >= id(grid_charge_target).state;'
+          then:
+            - logger.log: "Grid Charging reached target SOC, turning off"
+            - switch.turn_off: grid_charging
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: raw_reg_0034
@@ -1032,28 +1517,32 @@ sensor:
     id: raw_reg_0036
     name: "Raw Reg 0x0036"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0036
     register_type: holding
     value_type: U_WORD
+  # Inverter's own PV power figures, tracked PV1/PV2 V x I all day.
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
-    id: raw_reg_0037
-    name: "Raw Reg 0x0037"
-    disabled_by_default: true
-    entity_category: diagnostic
+    id: pv1_power_reported
+    name: "PV1 Power (Reported)"
     address: 0x0037
     register_type: holding
     value_type: U_WORD
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
-    id: raw_reg_0038
-    name: "Raw Reg 0x0038"
-    disabled_by_default: true
-    entity_category: diagnostic
+    id: pv2_power_reported
+    name: "PV2 Power (Reported)"
     address: 0x0038
     register_type: holding
     value_type: U_WORD
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: raw_reg_0039
@@ -1076,21 +1565,26 @@ sensor:
     state_class: total_increasing
     unit_of_measurement: "kWh"
     accuracy_decimals: 0
+  # Confirmed: 0 with no grid draw, 717-727 W while mains charging
+  # (~520 W into the battery plus load and losses), ~60 W at idle.
+  # Read as signed: if the inverter reports export as negative, it
+  # shows as negative watts here (unconfirmed until export is seen).
   - platform: modbus_controller
-    modbus_controller_id: datouboss_slow
-    id: raw_reg_003B
-    name: "Raw Reg 0x003B"
-    disabled_by_default: true
-    entity_category: diagnostic
+    modbus_controller_id: datouboss_fast
+    id: grid_input_power
+    name: "Grid Input Power"
     address: 0x003B
     register_type: holding
-    value_type: U_WORD
+    value_type: S_WORD
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: raw_reg_003C
     name: "Raw Reg 0x003C"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x003C
     register_type: holding
     value_type: U_WORD
@@ -1099,25 +1593,27 @@ sensor:
     id: raw_reg_003D
     name: "Raw Reg 0x003D"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x003D
     register_type: holding
     value_type: U_WORD
+  # Battery power magnitude (no sign): ~500 W discharging at 10 A,
+  # ~520 W charging at 10 A. Use "Battery Power" for direction.
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
-    id: raw_reg_003E
-    name: "Raw Reg 0x003E (possibly Total Output Energy)"
-    disabled_by_default: true
-    entity_category: diagnostic
+    id: battery_power_reported
+    name: "Battery Power (Reported, Unsigned)"
     address: 0x003E
     register_type: holding
     value_type: U_WORD
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     id: raw_reg_003F
-    name: "Raw Reg 0x003F (possibly Total Input Energy)"
+    name: "Raw Reg 0x003F"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x003F
     register_type: holding
     value_type: U_WORD
@@ -1126,7 +1622,6 @@ sensor:
     id: raw_reg_0040
     name: "Raw Reg 0x0040"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0040
     register_type: holding
     value_type: U_WORD
@@ -1135,7 +1630,6 @@ sensor:
     id: raw_reg_0041
     name: "Raw Reg 0x0041"
     disabled_by_default: true
-    entity_category: diagnostic
     address: 0x0041
     register_type: holding
     value_type: U_WORD
@@ -1182,55 +1676,6 @@ sensor:
     # not a broken or vestigial one. hi=0 -> "165V-280V" (narrow),
     # hi=1 -> "120V-280V" (wide), confirmed by direct write test.
     lambda: "return (int)(((uint16_t)x) >> 8);"
-  - platform: modbus_controller
-    modbus_controller_id: datouboss_slow
-    name: "Setting 0x0069 (voltage, unidentified)"
-    disabled_by_default: true
-    id: setting_v_0069
-    address: 0x0069
-    register_type: holding
-    value_type: U_WORD
-    unit_of_measurement: "V"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    filters: [multiply: 0.1]
-  - platform: modbus_controller
-    modbus_controller_id: datouboss_slow
-    name: "Setting 0x006A (voltage, unidentified)"
-    disabled_by_default: true
-    id: setting_v_006a
-    address: 0x006A
-    register_type: holding
-    value_type: U_WORD
-    unit_of_measurement: "V"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    filters: [multiply: 0.1]
-  - platform: modbus_controller
-    modbus_controller_id: datouboss_slow
-    name: "Setting 0x006C (voltage, unidentified)"
-    disabled_by_default: true
-    id: setting_v_006c
-    address: 0x006C
-    register_type: holding
-    value_type: U_WORD
-    unit_of_measurement: "V"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    filters: [multiply: 0.1]
-  - platform: modbus_controller
-    modbus_controller_id: datouboss_slow
-    name: "Setting 0x006D (voltage, unidentified)"
-    disabled_by_default: true
-    id: setting_v_006d
-    address: 0x006D
-    register_type: holding
-    value_type: U_WORD
-    unit_of_measurement: "V"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    filters: [multiply: 0.1]
-
   - platform: modbus_controller
     modbus_controller_id: datouboss_slow
     name: "MPPT1 Target Voltage"
@@ -1394,6 +1839,28 @@ sensor:
         return (id(ac_output_active_power).state / 6300.0f) * 100.0f;
       }
       return {};
+
+text_sensor:
+  # Neutral-ground bond relay, 0x0075 LOW byte. READ-ONLY on purpose:
+  # closing it where the system is already bonded at the main panel
+  # creates a second N-G bond.
+  - platform: template
+    name: "Setting: Neutral Grounding"
+    icon: "mdi:alert-octagon-outline"
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (isnan(id(reg_0075_raw).state)) return {};
+      return (((uint16_t) id(reg_0075_raw).state) & 0xFF)
+          ? std::string("Neutral Grounding (BOND CLOSED)") : std::string("Neutral Not Grounding");
+  - platform: template
+    name: "Setting: Battery Free Mode"
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (isnan(id(reg_0063_raw).state)) return {};
+      uint8_t v = ((uint16_t) id(reg_0063_raw).state) & 0xFF;
+      return v == 0 ? std::string("Battery Connected") : std::string("Raw ") + std::to_string(v);
 
 binary_sensor:
   - platform: modbus_controller
