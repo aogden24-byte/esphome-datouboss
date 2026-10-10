@@ -63,6 +63,34 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Grid Charging: gc_active records that ESPHome itself started a charge.
+  # The switch state and every automatic turn-off depend on it, so settings
+  # changed from the app can never make the switch read "on" or trigger the
+  # turn-off sequence. gc_prev_* hold the settings to restore afterwards.
+  - id: gc_active
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: gc_prev_load_priority
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: gc_prev_charger_priority
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: gc_prev_input_range
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: gc_prev_grid_mode
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: gc_prev_soc_pair
+    type: int
+    restore_value: true
+    initial_value: '-1'
 
 number:
   - platform: modbus_controller
@@ -707,11 +735,8 @@ switch:
     icon: "mdi:transmission-tower-import"
     optimistic: false
     restore_mode: DISABLED
-    lambda: |-
-      float pri = id(setting_charger_priority_num).state;
-      float rng = id(setting_ac_input_range_num).state;
-      if (isnan(pri) || isnan(rng)) return {};
-      return pri < 0.5 && rng > 0.5;
+    # State = ESPHome started a charge and has not ended it.
+    lambda: return id(gc_active);
     turn_on_action:
       - if:
           condition:
@@ -724,6 +749,17 @@ switch:
                 format: "Grid Charging refused: load above 1500 W, SOC unknown, or within 2 percent of target"
                 level: WARN
           else:
+            # Snapshot the settings to restore when the charge ends.
+            - lambda: |-
+                if (!id(gc_active)) {
+                  auto keep = [](float f) { return isnan(f) ? -1 : (int) f; };
+                  id(gc_prev_load_priority) = keep(id(setting_load_priority_num).state);
+                  id(gc_prev_charger_priority) = keep(id(setting_charger_priority_num).state);
+                  id(gc_prev_input_range) = keep(id(setting_ac_input_range_num).state);
+                  id(gc_prev_grid_mode) = keep(id(grid_connected_mode_num).state);
+                  id(gc_prev_soc_pair) = keep(id(soc_pair_raw).state);
+                }
+                id(gc_active) = true;
             # One write per register, 5 s apart, skipping values already
             # set: rapid back-to-back writes were being dropped.
             - if:
@@ -767,49 +803,68 @@ switch:
                   if (a21 > tgt - 1) a21 = tgt - 1;
                   return (float)((a21 << 8) | (tgt & 0xFF));
             - logger.log: "Grid Charging on: A21 above SOC, mains charge should start"
+    # OFF only acts if ESPHome started the charge: it stops the charge, then
+    # restores exactly the settings in place before it started (not a fixed
+    # "normal" set), so it never overrides app or export setups. Fixed
+    # 2026-10-10: the old settings-derived state read "on" after an app
+    # change to SNU, and the SOC-target guard then forced Off Grid / PBG.
     turn_off_action:
-      # A21 = 10, A22 = 5 in one write: A22 below SOC hands back to battery
-      # immediately, stopping any running charge.
-      - number.set:
-          id: soc_pair_raw
-          value: !lambda 'return (float)((10 << 8) | 5);'
-      - delay: 5s
-      - number.set:
-          id: soc_pair_raw
-          value: !lambda 'return (float)((10 << 8) | 80);'
-      - delay: 5s
       - if:
           condition:
-            lambda: 'return id(setting_charger_priority_num).state != 1;'
+            lambda: 'return !id(gc_active);'
           then:
+            - logger.log: "Grid Charging off: not started by ESPHome, nothing changed"
+          else:
+            # A22 = 5 hands back to battery immediately, stopping the charge.
             - number.set:
-                id: setting_charger_priority_num
-                value: 1
+                id: soc_pair_raw
+                value: !lambda |-
+                  int a21 = id(gc_prev_soc_pair) >= 0 ? (id(gc_prev_soc_pair) >> 8) : 10;
+                  if (a21 > 10) a21 = 10;
+                  return (float)((a21 << 8) | 5);
             - delay: 5s
-      - if:
-          condition:
-            lambda: 'return id(setting_ac_input_range_num).state != 0;'
-          then:
-            - number.set:
-                id: setting_ac_input_range_num
-                value: 0
-            - delay: 5s
-      - if:
-          condition:
-            lambda: 'return id(grid_connected_mode_num).state != 2;'
-          then:
-            - number.set:
-                id: grid_connected_mode_num
-                value: 2
-            - delay: 5s
-      - if:
-          condition:
-            lambda: 'return id(setting_load_priority_num).state != 3;'
-          then:
-            - number.set:
-                id: setting_load_priority_num
-                value: 3
-      - logger.log: "Grid Charging off: normal settings restored"
+            - if:
+                condition:
+                  lambda: 'return id(gc_prev_soc_pair) >= 0 && id(soc_pair_raw).state != id(gc_prev_soc_pair);'
+                then:
+                  - number.set:
+                      id: soc_pair_raw
+                      value: !lambda 'return (float) id(gc_prev_soc_pair);'
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(gc_prev_charger_priority) >= 0 && id(setting_charger_priority_num).state != id(gc_prev_charger_priority);'
+                then:
+                  - number.set:
+                      id: setting_charger_priority_num
+                      value: !lambda 'return (float) id(gc_prev_charger_priority);'
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(gc_prev_input_range) >= 0 && id(setting_ac_input_range_num).state != id(gc_prev_input_range);'
+                then:
+                  - number.set:
+                      id: setting_ac_input_range_num
+                      value: !lambda 'return (float) id(gc_prev_input_range);'
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(gc_prev_grid_mode) >= 0 && id(grid_connected_mode_num).state != id(gc_prev_grid_mode);'
+                then:
+                  - number.set:
+                      id: grid_connected_mode_num
+                      value: !lambda 'return (float) id(gc_prev_grid_mode);'
+                  - delay: 5s
+            - if:
+                condition:
+                  lambda: 'return id(gc_prev_load_priority) >= 0 && id(setting_load_priority_num).state != id(gc_prev_load_priority);'
+                then:
+                  - number.set:
+                      id: setting_load_priority_num
+                      value: !lambda 'return (float) id(gc_prev_load_priority);'
+                  - delay: 5s
+            - lambda: 'id(gc_active) = false;'
+            - logger.log: "Grid Charging off: previous settings restored"
 
 select:
   # Confirmed 2026-09-30, all four values, by direct app before/after
